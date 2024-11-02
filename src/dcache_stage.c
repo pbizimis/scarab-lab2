@@ -36,6 +36,7 @@
 
 #include "bp/bp.h"
 #include "dcache_stage.h"
+#include "libs/hash_lib.h"
 #include "map.h"
 #include "model.h"
 
@@ -70,6 +71,44 @@ void set_dcache_stage(Dcache_Stage* new_dc) {
   dc = new_dc;
 }
 
+/**********************LAB2 CODE ADDITION ********************************/
+
+/* Prototypes */
+void init_compulsory_miss_hash(void);
+void init_fake_cache(void);
+void check_miss_type(Dcache_Data* line, Dcache_Data* fake_line, Addr addr,
+                     uns proc_id);
+
+Hash_Table compulsory_hash;
+void       init_compulsory_miss_hash() {
+  // max line amount for 8GB ram and line size of 64: 134,217,728
+  uns32 hash_size = 13333337;  // prime number
+
+  init_hash_table(&compulsory_hash, "compulsory miss table", hash_size,
+                        sizeof(Flag));
+}
+
+Cache fake_dcache;
+void  init_fake_cache() {
+  init_cache(&fake_dcache, "FAKE DCACHE", DCACHE_SIZE,
+              DCACHE_SIZE / DCACHE_LINE_SIZE, DCACHE_LINE_SIZE,
+              sizeof(Dcache_Data), DCACHE_REPL);
+}
+
+void check_miss_type(Dcache_Data* line, Dcache_Data* fake_line, Addr addr,
+                     uns proc_id) {
+  if(!line) {
+    Flag new_entry;
+    hash_table_access_create(&compulsory_hash, addr, &new_entry);
+    if(new_entry) {
+      STAT_EVENT(proc_id, LAB2_COMP_MISS);
+    } else if(fake_line) {
+      STAT_EVENT(proc_id, LAB2_CONF_MISS);
+    } else {
+      STAT_EVENT(proc_id, LAB2_CAPA_MISS);
+    }
+  }
+}
 
 /**************************************************************************************/
 /* init_dcache_stage: */
@@ -93,6 +132,10 @@ void init_dcache_stage(uns8 proc_id, const char* name) {
   init_cache(&dc->dcache, "DCACHE", DCACHE_SIZE, DCACHE_ASSOC, DCACHE_LINE_SIZE,
              sizeof(Dcache_Data), DCACHE_REPL);
 
+/**********LAB2*************/
+  init_fake_cache();
+  init_compulsory_miss_hash();
+/***************************/
   reset_dcache_stage();
 
   dc->ports = (Ports*)malloc(sizeof(Ports) * DCACHE_BANKS);
@@ -123,6 +166,10 @@ void reset_dcache_stage(void) {
     dc->sd.ops[ii] = NULL;
   dc->sd.op_count = 0;
   dc->idle_cycle  = 0;
+
+  /****LAB2*****/
+  hash_table_clear(&compulsory_hash);
+  /*************/
 }
 
 
@@ -156,6 +203,10 @@ void debug_dcache_stage() {
 /* update_dcache_stage: */
 void update_dcache_stage(Stage_Data* src_sd) {
   Dcache_Data* line;
+/*********LAB2**********/
+  Dcache_Data* fake_line;
+  Addr         global_line_addr;
+/***********************/
   Counter      oldest_op_num, last_oldest_op_num;
   uns          oldest_index;
   int          start_op_count;
@@ -286,6 +337,13 @@ void update_dcache_stage(Stage_Data* src_sd) {
 
     line = (Dcache_Data*)cache_access(&dc->dcache, op->oracle_info.va,
                                       &line_addr, TRUE);
+
+    /*******LAB 2*************/
+    fake_line = (Dcache_Data*)cache_access(
+      &fake_dcache, op->oracle_info.va, &global_line_addr, TRUE);
+
+    /********************/
+
     op->dcache_cycle = cycle_count;
     dc->idle_cycle   = MAX2(dc->idle_cycle, cycle_count + DCACHE_CYCLES);
 
@@ -427,6 +485,9 @@ void update_dcache_stage(Stage_Data* src_sd) {
 
           if(!op->off_path) {
             STAT_EVENT(op->proc_id, DCACHE_MISS);
+            /*********LAB2********/
+            check_miss_type(line, fake_line, line_addr, op->proc_id);
+            /********************/
             STAT_EVENT(op->proc_id, DCACHE_MISS_ONPATH);
             STAT_EVENT(op->proc_id, DCACHE_MISS_LD_ONPATH);
             op->oracle_info.dcmiss = TRUE;
@@ -540,6 +601,9 @@ void update_dcache_stage(Stage_Data* src_sd) {
 
           if(!op->off_path) {
             STAT_EVENT(op->proc_id, DCACHE_MISS);
+            /*********LAB2********/
+            check_miss_type(line, fake_line, line_addr, op->proc_id);
+            /********************/
             STAT_EVENT(op->proc_id, DCACHE_MISS_ONPATH);
             STAT_EVENT(op->proc_id, DCACHE_MISS_ST_ONPATH);
             op->oracle_info.dcmiss = TRUE;
@@ -592,7 +656,7 @@ Flag dcache_fill_line(Mem_Req* req) {
   uns bank = req->addr >> dc->dcache.shift_bits &
              N_BIT_MASK(LOG2(DCACHE_BANKS));
   Dcache_Data* data;
-  Addr         line_addr, repl_line_addr;
+  Addr         line_addr, repl_line_addr, fake_line_addr, fake_repl_line_addr;
   Op*          op;
   Op**         op_p  = (Op**)list_start_head_traversal(&req->op_ptrs);
   Counter* op_unique = (Counter*)list_start_head_traversal(&req->op_uniques);
@@ -608,6 +672,7 @@ Flag dcache_fill_line(Mem_Req* req) {
   /* if it can't get a write port, fail */
   if(!get_write_port(&dc->ports[bank])) {
     cycle_count = old_cycle_count;
+    STAT_EVENT(dc->proc_id, DCACHE_FILL_PORT_UNAVAILABLE_ONPATH + req->off_path);
     return FAILURE;
   }
 
@@ -674,6 +739,12 @@ Flag dcache_fill_line(Mem_Req* req) {
 
     data = (Dcache_Data*)cache_insert(&dc->dcache, dc->proc_id, req->addr,
                                       &line_addr, &repl_line_addr);
+    /********LAB2*********/
+    // only insert to cache if cache_access returned NULL
+    if(!cache_access(&fake_dcache, req->addr, &fake_line_addr, FALSE))
+        cache_insert(&fake_dcache, dc->proc_id, req->addr, &fake_line_addr,
+                     &fake_repl_line_addr);
+    /********************/
     DEBUG(dc->proc_id,
           "Filling dcache  off_path:%d addr:0x%s  :%7d index:%7d op_count:%d "
           "oldest:%lld\n",
